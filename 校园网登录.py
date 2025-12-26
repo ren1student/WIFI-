@@ -172,7 +172,7 @@ def get_wifi_interface_info() -> dict:
         'signal': 0,
         'channel': 0,
         'authentication': None,
-        'available': False,
+        'available': True,  # WiFi接口通常总是可用的，除非硬件故障
         'rssi': 0
     }
     
@@ -194,7 +194,6 @@ def get_wifi_interface_info() -> dict:
         )
         
         if result.returncode == 0:
-            interface_info['available'] = True
             lines = result.stdout.split('\n')
             
             for line in lines:
@@ -252,7 +251,102 @@ def get_wifi_interface_info() -> dict:
                     auth = line.split(':', 1)[1].strip() if ':' in line else line
                     interface_info['authentication'] = auth
     
-    except Exception:
+    except Exception as e:
+        logger.error(f"获取WiFi接口信息失败: {e}")
+        # 即使失败，也认为WiFi接口可用（只是状态未知）
+        pass
+    
+    return interface_info
+
+def get_ethernet_interface_info() -> dict:
+    """获取有线接口状态信息"""
+    interface_info = {
+        'connected': False,  # 物理连接状态
+        'interface_name': None,
+        'description': None,
+        'available': True  # 有线接口通常总是可用的，除非硬件故障
+    }
+    
+    try:
+        # 获取所有网络接口状态
+        # 直接使用二进制模式然后手动解码，避免编码问题
+        kwargs = {
+            'stdout': subprocess.PIPE,
+            'stderr': subprocess.PIPE,
+            'timeout': 10
+        }
+        if platform.system() == 'Windows':
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        
+        result_bin = subprocess.run(
+            ['netsh', 'interface', 'show', 'interface'],
+            **kwargs
+        )
+        
+        # 尝试多种编码方式解码
+        stdout_bytes = result_bin.stdout
+        decoded_output = None
+        
+        # 尝试几种可能的编码
+        encodings = ['utf-8', 'gbk', 'gb2312', 'cp936']
+        for encoding in encodings:
+            try:
+                decoded_output = stdout_bytes.decode(encoding)
+                logger.debug(f"成功使用 {encoding} 编码解码netsh输出")
+                break
+            except UnicodeDecodeError:
+                continue
+        
+        # 如果所有编码都失败，使用错误忽略模式
+        if decoded_output is None:
+            decoded_output = stdout_bytes.decode('utf-8', errors='ignore')
+            logger.warning("使用错误忽略模式解码netsh输出")
+        
+        if result_bin.returncode == 0:
+            logger.info("成功执行netsh interface show interface命令")
+            logger.info(f"netsh输出: {repr(decoded_output)}")
+            lines = decoded_output.split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                logger.debug(f"接口行: {repr(line)}")
+                # 检查是否是有线网络接口，需要同时匹配以太网相关关键词
+                # 排除WLAN接口
+                if line and 'wlan' not in line.lower() and 'wireless' not in line.lower():
+                    logger.debug(f"处理非WLAN行: {line}")
+                    # 检查是否包含以太网相关关键词 - 也检查乱码版本
+                    has_ethernet = (any(indicator in line.lower() for indicator in ['以太网', 'ethernet', '本地连接', 'lan', '有线', 'eth']) 
+                                   or '以太网' in line 
+                                   or 'Ethernet' in line
+                                   # 检查可能的乱码版本
+                                   or '浠ュお缃' in line  # "以太网"的常见乱码
+                                   or '浠ユ太缃' in line)
+                    
+                    if has_ethernet:
+                        logger.info(f"找到包含以太网关键词的行: {line}")
+                        # 解析接口信息
+                        # 格式通常是: 管理员状态 状态 类型 接口名称
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            admin_state = parts[0]  # 管理员状态
+                            connection_state = parts[1]  # 状态
+                            interface_type = parts[2]  # 类型
+                            interface_name = parts[3]  # 接口名称
+                            
+                            interface_info['interface_name'] = interface_name
+                            interface_info['description'] = f"{interface_type} - {interface_name}"
+                            
+                            # 检查连接状态 - 这只是物理连接状态，不代表网络认证
+                            if '已连接' in connection_state or 'connected' in connection_state.lower() or '宸茶繛鎺' in connection_state:
+                                interface_info['connected'] = True
+                                logger.info(f"检测到有线接口物理连接: {interface_name} - 但需要认证才能访问网络")
+                        else:
+                            logger.info(f"行parts不足4个: {parts}")
+                        # 不再break，继续查找所有可能的以太网接口
+    
+    except Exception as e:
+        logger.error(f"获取有线接口信息失败: {e}")
+        # 即使失败，也认为有线接口可用（只是状态未知）
         pass
     
     return interface_info
@@ -287,9 +381,11 @@ def is_target_wifi_available() -> bool:
 
 def connect_to_target_wifi() -> bool:
     """基于WiFi接口状态进行连接（更稳定的识别逻辑）"""
+    logger.info("开始执行WiFi连接...")
     try:
         # 1. 获取当前WiFi接口状态
         interface_info = get_wifi_interface_info()
+        logger.info(f"当前WiFi接口状态: available={interface_info['available']}, connected={interface_info['connected']}, ssid={interface_info.get('ssid', 'N/A')}, signal={interface_info.get('signal', 'N/A')}")
         
         # 2. 如果WiFi接口不可用，返回False
         if not interface_info['available']:
@@ -326,28 +422,156 @@ def connect_to_target_wifi() -> bool:
             **kwargs
         )
         
+        logger.info(f"WiFi连接命令执行结果: {connect_result.returncode}")
+        
         # 优化等待逻辑：根据返回码动态等待
         if connect_result.returncode == 0:
+            logger.info("WiFi连接命令执行成功，等待2秒...")
             time.sleep(2)  # 成功则短等待
         else:
+            logger.info("WiFi连接命令执行失败，等待1秒...")
             time.sleep(1)  # 失败则更短等待
         
         # 7. 再次获取接口状态验证连接
         interface_info_after = get_wifi_interface_info()
+        logger.info(f"连接后WiFi接口状态: connected={interface_info_after['connected']}, ssid={interface_info_after.get('ssid', 'N/A')}, signal={interface_info_after.get('signal', 'N/A')}")
         
         success = (interface_info_after['connected'] and 
                   interface_info_after['ssid'] == TARGET_WIFI_SSID and
                   (interface_info_after['signal'] > 0 or interface_info_after['rssi'] < 0))
         
         if success:
-            logger.info(f"连接成功: {TARGET_WIFI_SSID} (信号: {interface_info_after['signal']}%)")
+            logger.info(f"WiFi连接成功: {TARGET_WIFI_SSID} (信号: {interface_info_after['signal']}%)")
         else:
-            logger.warning(f"连接失败或未连接到目标WiFi")
+            logger.warning(f"WiFi连接失败或未连接到目标WiFi")
         
         return success
         
     except Exception as e:
         logger.error(f"WiFi连接过程异常: {e}", exc_info=True)
+        return False
+
+def is_network_connected_standalone(test_host: str = "www.baidu.com", port: int = 80) -> bool:
+    """检查外网是否连接（独立版本，用于connect_ethernet_interface函数）"""
+    try:
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(3)
+        sock = socket.create_connection((test_host, port))
+        sock.close()
+        return True
+    except (OSError, socket.timeout, socket.gaierror):
+        return False
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+def connect_ethernet_interface() -> bool:
+    """启用有线网络接口"""
+    logger.info("开始执行有线网络连接...")
+    try:
+        # 获取当前有线接口状态
+        ethernet_info = get_ethernet_interface_info()
+        logger.info(f"当前有线接口状态: available={ethernet_info['available']}, connected={ethernet_info['connected']}, description={ethernet_info.get('description', 'N/A')}")
+        
+        # 如果有线接口已经连接，检查是否能访问网络
+        if ethernet_info['connected']:
+            logger.info(f"有线网络物理连接已建立: {ethernet_info.get('description', 'Unknown')}")
+            # 重要：物理连接不等于认证通过，还需要检查是否能访问网络
+            # 在校园网环境中，物理连接只是表示网线插好了，不代表可以上网
+            if is_network_connected_standalone():
+                logger.info("有线网络认证通过，可访问网络")
+                return True
+            else:
+                logger.info("有线网络物理连接已建立，但未通过认证，需要进行校园网认证")
+                # 物理连接已建立但认证未通过，返回True让主登录逻辑处理认证
+                # 这是校园网的典型场景：插上网线后需要认证才能上网
+                return True
+        
+        # 获取所有接口信息，找到未连接的以太网接口
+        kwargs = {
+            'capture_output': True,
+            'text': True,
+            'encoding': 'gbk',
+            'errors': 'ignore',
+            'timeout': 10
+        }
+        if platform.system() == 'Windows':
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        
+        result = subprocess.run(
+            ['netsh', 'interface', 'show', 'interface'],
+            **kwargs
+        )
+        
+        if result.returncode == 0:
+            logger.info("成功执行netsh interface show interface命令")
+            lines = result.stdout.split('\n')
+            for line in lines:
+                line = line.strip()
+                logger.debug(f"接口行: {line}")  # 添加调试信息
+                # 查找未连接的以太网接口
+                if '已断开' in line or 'disconnected' in line.lower():
+                    if any(ethernet_indicator in line.lower() for ethernet_indicator in 
+                          ['以太网', 'ethernet', '本地连接', 'lan', '有线', 'eth']) or '以太网' in line or 'Ethernet' in line:
+                        # 提取接口名称 - 改进提取逻辑
+                        parts = line.split()
+                        if len(parts) >= 1:
+                            # 通常接口名称在行的最后
+                            interface_name = parts[-1]
+                            logger.info(f"找到未连接的有线网络接口: {interface_name}")
+                            logger.info(f"尝试启用有线网络接口: {interface_name}")
+                            
+                            # 启用接口
+                            enable_result = subprocess.run(
+                                ['netsh', 'interface', 'set', 'interface', f'name="{interface_name}"', 'admin=enabled'],
+                                **kwargs
+                            )
+                            
+                            if enable_result.returncode == 0:
+                                logger.info(f"成功发送启用接口命令，等待3秒...")
+                                time.sleep(3)  # 等待接口启用
+                                # 再次检查连接状态
+                                new_ethernet_info = get_ethernet_interface_info()
+                                logger.info(f"启用后有线接口状态: connected={new_ethernet_info['connected']}, description={new_ethernet_info.get('description', 'N/A')}")
+                                if new_ethernet_info['connected']:
+                                    logger.info(f"有线网络连接成功: {new_ethernet_info.get('description', 'Unknown')}")
+                                    # 检查是否能够访问网络
+                                    if is_network_connected_standalone():
+                                        logger.info("有线网络认证通过，可访问网络")
+                                        return True
+                                    else:
+                                        logger.info("有线网络接口已启用，但未通过认证，需要进行校园网认证")
+                                        # 尝试校园网认证
+                                        # 返回True，让主登录逻辑处理认证
+                                        return True
+                                else:
+                                    logger.info("接口启用后仍未连接，尝试获取IP地址...")
+                                    # 尝试获取IP地址
+                                    ipconfig_result = subprocess.run(['ipconfig', '/renew'], **kwargs)
+                                    logger.info(f"ipconfig /renew 命令执行结果: {ipconfig_result.returncode}")
+                                    time.sleep(3)
+                                    # 最后检查一次
+                                    final_ethernet_info = get_ethernet_interface_info()
+                                    logger.info(f"最终有线接口状态: connected={final_ethernet_info['connected']}")
+                                    if final_ethernet_info['connected']:
+                                        # 检查是否能够访问网络
+                                        if is_network_connected_standalone():
+                                            logger.info("有线网络认证通过，可访问网络")
+                                            return True
+                                        else:
+                                            logger.info("有线网络接口已启用，但未通过认证，需要进行校园网认证")
+                                            # 返回True，让主登录逻辑处理认证
+                                            return True
+                                    return final_ethernet_info['connected']
+                            else:
+                                logger.warning(f"启用有线网络接口失败: {interface_name}，返回码: {enable_result.returncode}")
+        else:
+            logger.warning(f"netsh命令执行失败，返回码: {result.returncode}")
+        
+        logger.info("未能找到或启用有线网络接口")
+        return False
+        
+    except Exception as e:
+        logger.error(f"有线网络连接过程异常: {e}", exc_info=True)
         return False
 
 class StartupFolderManager:
@@ -687,6 +911,15 @@ class CampusNetLogin:
         finally:
             socket.setdefaulttimeout(old_timeout)
 
+    def is_network_connected_http(self, test_url: str = "http://www.baidu.com", timeout: int = 5) -> bool:
+        """通过HTTP请求检查外网是否连接（更严格的检测）"""
+        try:
+            response = self.session.get(test_url, timeout=timeout)
+            # 检查是否返回了有效的HTTP响应（200-399）
+            return 200 <= response.status_code < 400
+        except:
+            return False
+
     def get_available_server(self) -> Optional[Dict[str, Any]]:
         """获取可用的认证服务器"""
         for server in AUTH_SERVERS:
@@ -754,7 +987,7 @@ class CampusNetLogin:
         return f"{base_url}?{param_str}"
 
     def login(self, username: str, password: str, ip: Optional[str] = None) -> Tuple[bool, str]:
-        """执行登录操作 - 高速优化版本"""
+        """执行登录操作 - 高速优化版本（支持有线和无线网络）"""
         # ========== 新增：登录时同步更新触发时间 ==========
         self.last_trigger_time = time.time()
         
@@ -766,27 +999,111 @@ class CampusNetLogin:
         
         # 1. 快速预检查：并行获取关键信息，减少串行等待
         wifi_info = get_wifi_interface_info()
-        network_ready = self.is_network_connected()
+        ethernet_info = get_ethernet_interface_info()
+        network_ready = self.is_network_connected()  # 检查是否可以访问外网
         
-        # 2. 智能WiFi连接：只在真正需要时连接
+        # 添加调试日志
+        logger.info(f"WiFi状态 - 可用: {wifi_info['available']}, 已连接: {wifi_info['connected']}, SSID: {wifi_info.get('ssid', 'N/A')}")
+        logger.info(f"有线网络状态 - 可用: {ethernet_info['available']}, 已连接: {ethernet_info['connected']}, 描述: {ethernet_info.get('description', 'N/A')}")
+        logger.info(f"网络连接状态: {network_ready}")
+        
+        # 检测到有线物理连接时，强制执行一次认证（无论当前网络状态如何）
+        if ethernet_info['connected']:
+            logger.info("检测到有线物理连接，强制执行认证")
+            # 连接物理接口
+            result = connect_ethernet_interface()
+            if result:
+                logger.info("有线网络物理连接完成")
+                
+                # 无论当前网络状态如何，都执行HTTP认证以确保有线网络被认证
+                # 这样即使WiFi已连接，有线网络也会被认证
+                logger.info("执行有线网络HTTP认证")
+                
+                # 获取IP地址用于认证
+                if not ip:
+                    ip = self.get_local_ip()
+                    if not ip:
+                        return False, "无法获取本地IP地址"
+                
+                server = self._get_available_server_fast()
+                if not server:
+                    return False, "认证服务器不可达"
+                
+                try:
+                    server_ip = self._get_server_ip_optimized(server)
+                    login_url = self.build_login_url(server, username, password, server_ip)
+                    login_response = self.session.get(login_url, timeout=TIMEOUT)
+                    login_response.raise_for_status()
+                    
+                    result = self._parse_login_response_fast(login_response, username, password)
+                    logger.info("有线网络认证请求已发送")
+                    return result
+                except requests.exceptions.Timeout:
+                    return False, "请求超时"
+                except requests.exceptions.ConnectionError:
+                    return False, "服务器连接失败"
+                except Exception as e:
+                    if self.is_network_connected_http():
+                        logger.info("有线网络认证成功")
+                        return True, "有线网络认证成功"
+                    else:
+                        return False, f"登录异常：{str(e)}"
+            else:
+                logger.error("有线网络连接失败")
+        
+        # 2. 智能网络连接：检测并连接有线或无线网络
+        # 注意：ethernet_info['connected'] 表示物理连接状态（网线是否插好）
+        #      network_ready 表示网络认证状态（是否能访问外网）
         wifi_connected_target = (wifi_info['connected'] and 
                             wifi_info['ssid'] == "SZU_CTC&CMCC")
+        ethernet_connected = ethernet_info['connected']  # 这是物理连接状态
         
-        if not wifi_connected_target:
-            # 只在未连接到目标WiFi时才连接，减少不必要等待
+        # 根据当前连接状态决定连接策略
+        if not wifi_connected_target and not ethernet_connected:
+            # 都未连接，尝试连接有线和/或无线网络
+            logger.info("WiFi和有线网络都未连接，开始并行连接...")
+            connections_to_attempt = []
+            
+            if ethernet_info['available']:
+                logger.info("有线网络接口可用，添加到连接列表")
+                connections_to_attempt.append(connect_ethernet_interface)
+            else:
+                logger.info("有线网络接口不可用")
+            
+            if wifi_info['available']:
+                logger.info("WiFi接口可用，添加到连接列表")
+                connections_to_attempt.append(connect_to_target_wifi)
+            else:
+                logger.info("WiFi接口不可用")
+            
+            # 同时尝试连接
+            threads = []
+            for conn_func in connections_to_attempt:
+                logger.info(f"启动连接线程: {conn_func.__name__}")
+                thread = threading.Thread(target=conn_func, daemon=True)
+                thread.start()
+                threads.append(thread)
+            
+            # 等待连接完成
+            for thread in threads:
+                thread.join(timeout=3)  # 最多等待3秒
+        elif not wifi_connected_target:
+            # 只有WiFi未连接，连接WiFi
+            logger.info("仅WiFi未连接，连接WiFi")
             connect_to_target_wifi()
-        else:
-            # WiFi已连接，跳过3秒等待时间
-            pass
+        elif not ethernet_connected:
+            # 只有有线网络未连接，连接有线网络
+            # 注意：物理连接不等于认证通过，connect_ethernet_interface会处理认证
+            logger.info("仅有线网络未连接，连接有线网络")
+            connect_ethernet_interface()
         
         # 3. 如果网络已连接，快速验证并返回（避免重复登录）
         if network_ready:
-            try:
-                test_response = self.session.get("http://www.baidu.com", timeout=2)
-                if test_response.status_code == 200:
-                    return True, "网络已连接，账号已在线"
-            except:
-                pass
+            # 使用更严格的HTTP检查来确认是否真的可以访问外网
+            if self.is_network_connected_http():
+                return True, "网络已连接，账号已在线"
+            else:
+                logger.info("网络物理连接存在，但HTTP访问失败，需要进行认证")
         
         # 4. 并行准备：IP获取和服务器选择同时进行
         if not ip:
@@ -817,7 +1134,8 @@ class CampusNetLogin:
             return False, "服务器连接失败"
         except Exception as e:
             # 快速兜底：网络已连接就认为成功
-            if self.is_network_connected():
+            # 使用更严格的HTTP检查来确认网络状态
+            if self.is_network_connected_http():
                 return True, "网络已连接"
             else:
                 return False, f"登录异常：{str(e)}"
@@ -929,14 +1247,14 @@ class CampusNetLogin:
             return False
         
         # 开机自启模式：仅在网络未连接时才连接WiFi（减少耗时）
-        if not self.is_network_connected():
+        if not self.is_network_connected_http():
             # 异步连接WiFi，不阻塞登录
             threading.Thread(target=connect_to_target_wifi, daemon=True).start()
         
         # 快速登录：直接用缓存IP + 主服务器，跳过服务器探测
         server = AUTH_SERVERS[0]  # 优先主服务器，不探测
         ip = self._cached_ip or DEFAULT_IP  # 用缓存IP或默认IP，不获取新IP
-        if server and not self.is_network_connected():
+        if server and not self.is_network_connected_http():
             success, msg = self.login(self.username, self.password, ip)
             logger.info(f"开机自启登录结果: {success}, {msg}")
             return success
@@ -1188,7 +1506,7 @@ class CampusNetLogin:
                 try:
                     while self.running:
                         time.sleep(300)  # 5分钟检测一次（原3600秒）
-                        if not self.is_network_connected():
+                        if not self.is_network_connected_http():
                             self.auto_login()
                 except KeyboardInterrupt:
                     self.cleanup()
